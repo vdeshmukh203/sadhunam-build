@@ -1,11 +1,5 @@
 name: private-build
 
-# Builds Sadhunam.App.exe from an ENCRYPTED source blob, so the public repo never
-# contains readable source. The decryption key lives only in the Actions secret
-# SRC_KEY (which staying-public does NOT expose), is injected at runtime, and is
-# auto-redacted from these public logs. The built exe is re-encrypted before upload,
-# so even the artifact is ciphertext. You decrypt it locally with the same key.
-
 on:
   workflow_dispatch:
   push:
@@ -22,10 +16,19 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Decrypt source
-        shell: bash
+        shell: pwsh
         env:
           SRC_KEY: ${{ secrets.SRC_KEY }}
-        run: openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass env:SRC_KEY -in source.enc -out src.zip
+        run: |
+          $key  = [Convert]::FromBase64String($env:SRC_KEY)
+          $blob = [IO.File]::ReadAllBytes("source.enc")
+          $iv   = New-Object byte[] 16
+          $ct   = New-Object byte[] ($blob.Length - 16)
+          [Array]::Copy($blob, 0, $iv, 0, 16)
+          [Array]::Copy($blob, 16, $ct, 0, $ct.Length)
+          $aes = [Security.Cryptography.Aes]::Create(); $aes.Key = $key; $aes.IV = $iv
+          $pt  = $aes.CreateDecryptor().TransformFinalBlock($ct, 0, $ct.Length)
+          [IO.File]::WriteAllBytes("src.zip", $pt)
 
       - name: Unpack source
         shell: pwsh
@@ -40,3 +43,26 @@ jobs:
           dotnet publish app/src/Sadhunam.App/Sadhunam.App.csproj
           -c Release -r win-x64 --self-contained true
           -p:Platform=x64 -p:WindowsPackageType=None -p:WindowsAppSDKSelfContained=true
+          -o out
+
+      - name: Package + re-encrypt the build
+        shell: pwsh
+        env:
+          SRC_KEY: ${{ secrets.SRC_KEY }}
+        run: |
+          Compress-Archive -Path out/* -DestinationPath app.zip -Force
+          $key = [Convert]::FromBase64String($env:SRC_KEY)
+          $pt  = [IO.File]::ReadAllBytes("app.zip")
+          $aes = [Security.Cryptography.Aes]::Create(); $aes.Key = $key; $aes.GenerateIV()
+          $ct  = $aes.CreateEncryptor().TransformFinalBlock($pt, 0, $pt.Length)
+          $out = New-Object byte[] (16 + $ct.Length)
+          [Array]::Copy($aes.IV, 0, $out, 0, 16)
+          [Array]::Copy($ct, 0, $out, 16, $ct.Length)
+          [IO.File]::WriteAllBytes("app.enc", $out)
+
+      - name: Upload encrypted build (ciphertext only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sadhunam-app-encrypted
+          path: app.enc
+          retention-days: 1
