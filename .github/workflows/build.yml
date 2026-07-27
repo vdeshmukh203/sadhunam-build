@@ -6,7 +6,7 @@ on:
     branches: [ main, master ]
 
 permissions:
-  contents: read
+  contents: write   # required to publish the rolling release
 
 jobs:
   build:
@@ -15,12 +15,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # SRC_KEY is used verbatim when it decodes to a legal AES key length (16/24/32 bytes), so an
+      # existing working key keeps working. Anything else is treated as a passphrase and SHA-256'd
+      # into 32 bytes. Publish-EncryptedSource.ps1 in the private repo applies the SAME rule when
+      # it produces source.enc; if the two ever diverge, this decrypts with the wrong key.
       - name: Decrypt source
         shell: pwsh
         env:
           SRC_KEY: ${{ secrets.SRC_KEY }}
         run: |
-          $key  = [Convert]::FromBase64String($env:SRC_KEY)
+          $raw = [Convert]::FromBase64String($env:SRC_KEY)
+          if ($raw.Length -in 16, 24, 32) {
+            $key = $raw
+            Write-Host "key: $($raw.Length) bytes, used directly"
+          } else {
+            $key = [Security.Cryptography.SHA256]::Create().ComputeHash($raw)
+            Write-Host "key: $($raw.Length) bytes is not an AES length, derived 32 via SHA-256"
+          }
           $blob = [IO.File]::ReadAllBytes("source.enc")
           $iv   = New-Object byte[] 16
           $ct   = New-Object byte[] ($blob.Length - 16)
@@ -52,7 +63,9 @@ jobs:
           SRC_KEY: ${{ secrets.SRC_KEY }}
         run: |
           Compress-Archive -Path out/* -DestinationPath app.zip -Force
-          $key = [Convert]::FromBase64String($env:SRC_KEY)
+          $raw = [Convert]::FromBase64String($env:SRC_KEY)
+          $key = if ($raw.Length -in 16, 24, 32) { $raw }
+                 else { [Security.Cryptography.SHA256]::Create().ComputeHash($raw) }
           $pt  = [IO.File]::ReadAllBytes("app.zip")
           $aes = [Security.Cryptography.Aes]::Create(); $aes.Key = $key; $aes.GenerateIV()
           $ct  = $aes.CreateEncryptor().TransformFinalBlock($pt, 0, $pt.Length)
@@ -60,6 +73,7 @@ jobs:
           [Array]::Copy($aes.IV, 0, $out, 0, 16)
           [Array]::Copy($ct, 0, $out, 16, $ct.Length)
           [IO.File]::WriteAllBytes("app.enc", $out)
+          Write-Host "app.enc: $([math]::Round($out.Length / 1MB, 2)) MB"
 
       - name: Upload encrypted build (ciphertext only)
         uses: actions/upload-artifact@v4
@@ -67,3 +81,46 @@ jobs:
           name: Sadhunam-app-encrypted
           path: app.enc
           retention-days: 1
+
+      # A stable download that does not expire in a day and does not need a login. Still ciphertext.
+      - name: Publish to rolling "latest" release
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $api  = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+          $auth = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github+json" }
+
+          $notes = @"
+          Encrypted Sadhunam.App build (self-contained win-x64).
+
+          Built from source.enc at ``$env:GITHUB_SHA`` on windows-latest.
+          ``app.enc`` is AES-CBC ciphertext with the IV as the first 16 bytes - the same shape as
+          source.enc, and it opens with the same SRC_KEY. Nothing readable is published here.
+          "@
+
+          try {
+            $rel = Invoke-RestMethod -Method Post -Uri "$api/releases" -Headers $auth -Body (@{
+              tag_name         = 'latest'
+              name             = 'Sadhunam app (encrypted build)'
+              body             = $notes
+              target_commitish = $env:GITHUB_SHA
+            } | ConvertTo-Json)
+          } catch {
+            $rel = Invoke-RestMethod -Method Get -Uri "$api/releases/tags/latest" -Headers $auth
+            Invoke-RestMethod -Method Patch -Uri "$api/releases/$($rel.id)" -Headers $auth `
+              -Body (@{ body = $notes } | ConvertTo-Json) | Out-Null
+          }
+
+          foreach ($a in $rel.assets) {
+            if ($a.name -eq 'app.enc') {
+              Invoke-RestMethod -Method Delete -Uri "$api/releases/assets/$($a.id)" -Headers $auth
+            }
+          }
+
+          Invoke-RestMethod -Method Post -Headers $auth -ContentType 'application/octet-stream' `
+            -Uri "https://uploads.github.com/repos/$env:GITHUB_REPOSITORY/releases/$($rel.id)/assets?name=app.enc" `
+            -InFile 'app.enc' | Out-Null
+
+          Write-Host "published -> $($rel.html_url)"
