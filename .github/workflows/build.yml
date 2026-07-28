@@ -1,12 +1,47 @@
 name: private-build
 
+# Builds Sadhunam.App (WinUI 3, Windows-only) on a free GitHub-hosted windows-latest runner and
+# publishes the result as ciphertext.
+#
+# Why this repo is public: Actions on the private repo are quota-blocked on hosted runners, and the
+# self-hosted fallback is unreliable. A public repo gets free unlimited hosted minutes, which is the
+# only dependable way to build this app.
+#
+# Where the source comes from:
+#   - SRC_PAT set  -> the runner checks out the private repo directly. Always current; nothing to
+#                     maintain by hand. This is the intended mode.
+#   - SRC_PAT unset-> falls back to the committed source.enc blob. Works, but only as fresh as the
+#                     last time somebody re-encrypted it.
+# Either way the source exists only in the runner's ephemeral workspace and is never published.
+#
+# SECURITY: there is deliberately no pull_request trigger. GitHub withholds secrets from workflows
+# triggered by fork pull requests, and pull_request_target would defeat that protection, so neither
+# is used. Only workflow_dispatch and pushes to main run this, both of which need write access here.
+
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or SHA of the private repo to build'
+        required: false
+        default: 'claude/browser-ui-merge-reconcile-2kwygj'
   push:
     branches: [ main, master ]
+  schedule:
+    # Daily, so drift between the private repo and the last published build is bounded even if
+    # nobody triggers anything. A build that produces an identical exe costs two minutes.
+    - cron: '0 4 * * *'
 
 permissions:
   contents: write   # required to publish the rolling release
+
+concurrency:
+  group: private-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SRC_REPO: vdeshmukh203/claude-plans
+  SRC_REF: ${{ inputs.ref || 'claude/browser-ui-merge-reconcile-2kwygj' }}
 
 jobs:
   build:
@@ -15,74 +50,188 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # SRC_KEY is used verbatim when it decodes to a legal AES key length (16/24/32 bytes), so an
-      # existing working key keeps working. Anything else is treated as a passphrase and SHA-256'd
-      # into 32 bytes. Publish-EncryptedSource.ps1 in the private repo applies the SAME rule when
-      # it produces source.enc; if the two ever diverge, this decrypts with the wrong key.
-      - name: Decrypt source
+      - name: Decide where the source comes from
+        id: mode
+        shell: pwsh
+        env:
+          SRC_PAT: ${{ secrets.SRC_PAT }}
+        run: |
+          if ($env:SRC_PAT) {
+            Write-Host "source: private repo $env:SRC_REPO @ $env:SRC_REF (live)"
+            "mode=live" | Add-Content $env:GITHUB_OUTPUT
+          } elseif (Test-Path source.enc) {
+            Write-Host "::warning::SRC_PAT is not set - falling back to the committed source.enc, which is only as fresh as its last refresh. Set SRC_PAT to build current source."
+            "mode=blob" | Add-Content $env:GITHUB_OUTPUT
+          } else {
+            throw "No source available: SRC_PAT is unset and source.enc is missing."
+          }
+
+      # --- live path -------------------------------------------------------------------------
+      - name: Check out the private source
+        if: steps.mode.outputs.mode == 'live'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_PAT }}
+          path: private
+          fetch-depth: 1
+
+      - name: Lay the source out where the build expects it
+        if: steps.mode.outputs.mode == 'live'
+        shell: pwsh
+        run: |
+          # The build below wants app/src/...; the private repo keeps it under sadhunam/src/.
+          New-Item -ItemType Directory -Path app -Force | Out-Null
+          Copy-Item private/sadhunam/src -Destination app/src -Recurse -Force
+          Write-Host "built from $env:SRC_REPO @ $(git -C private rev-parse --short HEAD)"
+
+      # --- fallback path ---------------------------------------------------------------------
+      # SRC_KEY is used verbatim when it decodes to a legal AES key length (16/24/32 bytes); anything
+      # else is treated as a passphrase and SHA-256'd into 32 bytes. Publish-EncryptedSource.ps1 in
+      # the private repo applies the identical rule when producing the blob.
+      - name: Decrypt and unpack source.enc
+        if: steps.mode.outputs.mode == 'blob'
         shell: pwsh
         env:
           SRC_KEY: ${{ secrets.SRC_KEY }}
         run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:SRC_KEY) { throw "source.enc is present but SRC_KEY is not set - nothing can decrypt it." }
+
           $raw = [Convert]::FromBase64String($env:SRC_KEY)
           if ($raw.Length -in 16, 24, 32) {
-            $key = $raw
-            Write-Host "key: $($raw.Length) bytes, used directly"
+            $key = $raw; Write-Host "key: $($raw.Length) bytes, used directly"
           } else {
             $key = [Security.Cryptography.SHA256]::Create().ComputeHash($raw)
             Write-Host "key: $($raw.Length) bytes is not an AES length, derived 32 via SHA-256"
           }
+
           $blob = [IO.File]::ReadAllBytes("source.enc")
-          $iv   = New-Object byte[] 16
-          $ct   = New-Object byte[] ($blob.Length - 16)
+          if ($blob.Length -le 16) { throw "source.enc is $($blob.Length) bytes - too small to contain an IV and any ciphertext." }
+          if (($blob.Length - 16) % 16 -ne 0) { throw "source.enc is not a whole number of AES blocks after the 16-byte IV - it is truncated or not CBC ciphertext." }
+
+          $iv = New-Object byte[] 16
+          $ct = New-Object byte[] ($blob.Length - 16)
           [Array]::Copy($blob, 0, $iv, 0, 16)
           [Array]::Copy($blob, 16, $ct, 0, $ct.Length)
           $aes = [Security.Cryptography.Aes]::Create(); $aes.Key = $key; $aes.IV = $iv
-          $pt  = $aes.CreateDecryptor().TransformFinalBlock($ct, 0, $ct.Length)
-          [IO.File]::WriteAllBytes("src.zip", $pt)
+          try {
+            $pt = $aes.CreateDecryptor().TransformFinalBlock($ct, 0, $ct.Length)
+          } catch {
+            throw "Decrypt failed. This almost always means SRC_KEY does not match the key source.enc was encrypted with - the padding check is what fails first. ($($_.Exception.Message))"
+          }
 
-      - name: Unpack source
+          # A zip starts with PK\x03\x04. Checking here turns a confusing Expand-Archive error into a
+          # clear one about the wrong key producing plausible-looking garbage.
+          if ($pt[0] -ne 0x50 -or $pt[1] -ne 0x4B) { throw "Decrypted output is not a zip archive - SRC_KEY is probably wrong." }
+
+          [IO.File]::WriteAllBytes("src.zip", $pt)
+          Expand-Archive -Path src.zip -DestinationPath app -Force
+
+      # --- from here both paths are identical -------------------------------------------------
+      - name: Validate the source tree before building
         shell: pwsh
-        run: Expand-Archive -Path src.zip -DestinationPath app -Force
+        run: |
+          $proj = "app/src/Sadhunam.App/Sadhunam.App.csproj"
+          if (-not (Test-Path $proj)) {
+            Get-ChildItem app -Recurse -Depth 2 | Select-Object -First 40 FullName | Out-Host
+            throw "$proj is missing - the source landed in an unexpected layout (listing above)."
+          }
+          $count = (Get-ChildItem app -Recurse -File -Filter *.cs).Count
+          Write-Host "source: $count .cs files"
+          if ($count -lt 50) { throw "Only $count .cs files - the source tree looks truncated." }
 
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
+      # Restore separately, with retries: it is the only network-bound step, and a transient NuGet
+      # failure should not cost the whole run. -r win-x64 keeps win-x86 and win-arm64 runtime packs
+      # out of the graph entirely, which is roughly a third of the download.
+      - name: Restore (win-x64, with retries)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          for ($i = 1; $i -le 4; $i++) {
+            dotnet restore app/src/Sadhunam.App/Sadhunam.App.csproj -r win-x64
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Write-Host "::warning::restore attempt $i failed with $LASTEXITCODE"
+            Start-Sleep -Seconds (10 * $i)
+          }
+          throw "restore failed after 4 attempts"
+
       - name: Build self-contained exe
         run: >
           dotnet publish app/src/Sadhunam.App/Sadhunam.App.csproj
-          -c Release -r win-x64 --self-contained true
+          -c Release -r win-x64 --self-contained true --no-restore
           -p:Platform=x64 -p:WindowsPackageType=None -p:WindowsAppSDKSelfContained=true
           -p:TreatWarningsAsErrors=false -p:NuGetAudit=false
           -o out
 
-      - name: Package + re-encrypt the build
+      - name: Verify the build produced a runnable app
+        shell: pwsh
+        run: |
+          $exe = "out/Sadhunam.App.exe"
+          if (-not (Test-Path $exe)) { throw "publish reported success but $exe does not exist." }
+          $mb = [math]::Round((Get-Item $exe).Length / 1MB, 2)
+          $files = (Get-ChildItem out -Recurse -File).Count
+          Write-Host "built: $exe ($mb MB), $files files in out/"
+          # Self-contained WinUI publishes carry the runtime and the App SDK; a handful of files
+          # means the publish silently produced a framework-dependent stub.
+          if ($files -lt 50) { throw "out/ holds only $files files - this is not a self-contained publish." }
+          if (-not (Test-Path "out/Microsoft.WindowsAppRuntime.Bootstrap.dll")) {
+            Write-Host "::warning::WindowsAppRuntime bootstrap not found in out/ - the app may not start on a machine without the App SDK installed."
+          }
+
+      - name: Package and encrypt the build
         shell: pwsh
         env:
           SRC_KEY: ${{ secrets.SRC_KEY }}
         run: |
+          $ErrorActionPreference = 'Stop'
           Compress-Archive -Path out/* -DestinationPath app.zip -Force
+
+          if (-not $env:SRC_KEY) {
+            Write-Host "::warning::SRC_KEY is not set - publishing the build UNENCRYPTED."
+            Copy-Item app.zip app.enc -Force
+            "encrypted=false" | Add-Content $env:GITHUB_ENV
+            return
+          }
+
           $raw = [Convert]::FromBase64String($env:SRC_KEY)
           $key = if ($raw.Length -in 16, 24, 32) { $raw }
                  else { [Security.Cryptography.SHA256]::Create().ComputeHash($raw) }
           $pt  = [IO.File]::ReadAllBytes("app.zip")
           $aes = [Security.Cryptography.Aes]::Create(); $aes.Key = $key; $aes.GenerateIV()
           $ct  = $aes.CreateEncryptor().TransformFinalBlock($pt, 0, $pt.Length)
-          $out = New-Object byte[] (16 + $ct.Length)
-          [Array]::Copy($aes.IV, 0, $out, 0, 16)
-          [Array]::Copy($ct, 0, $out, 16, $ct.Length)
-          [IO.File]::WriteAllBytes("app.enc", $out)
-          Write-Host "app.enc: $([math]::Round($out.Length / 1MB, 2)) MB"
+          $blob = New-Object byte[] (16 + $ct.Length)
+          [Array]::Copy($aes.IV, 0, $blob, 0, 16)
+          [Array]::Copy($ct, 0, $blob, 16, $ct.Length)
+          [IO.File]::WriteAllBytes("app.enc", $blob)
 
-      - name: Upload encrypted build (ciphertext only)
+          # Verify the ciphertext opens before it is published. Shipping a blob nobody can decrypt
+          # is worse than failing here, because it is only discovered by whoever tries to use it.
+          $iv2 = New-Object byte[] 16
+          $ct2 = New-Object byte[] ($blob.Length - 16)
+          [Array]::Copy($blob, 0, $iv2, 0, 16)
+          [Array]::Copy($blob, 16, $ct2, 0, $ct2.Length)
+          $aes2 = [Security.Cryptography.Aes]::Create(); $aes2.Key = $key; $aes2.IV = $iv2
+          $back = $aes2.CreateDecryptor().TransformFinalBlock($ct2, 0, $ct2.Length)
+          if ($back.Length -ne $pt.Length) { throw "round-trip check failed: $($back.Length) vs $($pt.Length) bytes" }
+
+          Write-Host "app.enc: $([math]::Round($blob.Length / 1MB, 2)) MB, verified decryptable"
+          "encrypted=true" | Add-Content $env:GITHUB_ENV
+
+      - name: Upload run artifact
         uses: actions/upload-artifact@v4
         with:
           name: Sadhunam-app-encrypted
           path: app.enc
-          retention-days: 1
+          retention-days: 7
 
-      # A stable download that does not expire in a day and does not need a login. Still ciphertext.
+      # A stable URL that does not expire and needs no login. Ciphertext, so nothing readable is
+      # made public.
       - name: Publish to rolling "latest" release
         shell: pwsh
         env:
@@ -92,20 +241,33 @@ jobs:
           $api  = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
           $auth = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github+json" }
 
-          $notes = @"
-          Encrypted Sadhunam.App build (self-contained win-x64).
+          $state = if ($env:encrypted -eq 'true') {
+            "``app.enc`` is AES-CBC ciphertext with the IV as the first 16 bytes - the same shape as source.enc, opened with the same SRC_KEY."
+          } else {
+            "WARNING: SRC_KEY was not set, so ``app.enc`` is a PLAIN zip despite the name."
+          }
 
-          Built from source.enc at ``$env:GITHUB_SHA`` on windows-latest.
-          ``app.enc`` is AES-CBC ciphertext with the IV as the first 16 bytes - the same shape as
-          source.enc, and it opens with the same SRC_KEY. Nothing readable is published here.
+          $notes = @"
+          Sadhunam.App - self-contained win-x64, built on windows-latest.
+
+          Built $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC from ``$env:SRC_REPO`` @ ``$env:SRC_REF``.
+          $state
           "@
+
+          function Invoke-WithRetry([scriptblock]$op, [string]$what) {
+            for ($i = 1; $i -le 3; $i++) {
+              try { return & $op } catch {
+                if ($i -eq 3) { throw "$what failed after 3 attempts: $($_.Exception.Message)" }
+                Write-Host "::warning::$what attempt $i failed, retrying"
+                Start-Sleep -Seconds (5 * $i)
+              }
+            }
+          }
 
           try {
             $rel = Invoke-RestMethod -Method Post -Uri "$api/releases" -Headers $auth -Body (@{
-              tag_name         = 'latest'
-              name             = 'Sadhunam app (encrypted build)'
-              body             = $notes
-              target_commitish = $env:GITHUB_SHA
+              tag_name = 'latest'; name = 'Sadhunam app (latest build)'
+              body = $notes; target_commitish = $env:GITHUB_SHA
             } | ConvertTo-Json)
           } catch {
             $rel = Invoke-RestMethod -Method Get -Uri "$api/releases/tags/latest" -Headers $auth
@@ -119,8 +281,19 @@ jobs:
             }
           }
 
-          Invoke-RestMethod -Method Post -Headers $auth -ContentType 'application/octet-stream' `
-            -Uri "https://uploads.github.com/repos/$env:GITHUB_REPOSITORY/releases/$($rel.id)/assets?name=app.enc" `
-            -InFile 'app.enc' | Out-Null
+          Invoke-WithRetry {
+            Invoke-RestMethod -Method Post -Headers $auth -ContentType 'application/octet-stream' `
+              -Uri "https://uploads.github.com/repos/$env:GITHUB_REPOSITORY/releases/$($rel.id)/assets?name=app.enc" `
+              -InFile 'app.enc' | Out-Null
+          } "asset upload"
 
-          Write-Host "published -> $($rel.html_url)"
+          # Read it back: an upload that reports success but stores nothing is a real failure mode,
+          # and the only way to know is to ask for the asset again.
+          $check = Invoke-RestMethod -Method Get -Uri "$api/releases/tags/latest" -Headers $auth
+          $asset = $check.assets | Where-Object { $_.name -eq 'app.enc' }
+          $local = (Get-Item app.enc).Length
+          if (-not $asset)                { throw "app.enc is not on the release after upload." }
+          if ($asset.size -ne $local)     { throw "published asset is $($asset.size) bytes, expected $local." }
+          if ($asset.state -ne 'uploaded'){ throw "published asset state is '$($asset.state)', expected 'uploaded'." }
+
+          Write-Host "verified: app.enc $($asset.size) bytes -> $($check.html_url)"
