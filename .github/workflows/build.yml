@@ -3,9 +3,10 @@ name: private-build
 # Builds Sadhunam.App (WinUI 3, Windows-only) on a free GitHub-hosted windows-latest runner and
 # publishes the result as ciphertext.
 #
-# Why this repo is public: Actions on the private repo are quota-blocked on hosted runners, and the
-# self-hosted fallback is unreliable. A public repo gets free unlimited hosted minutes, which is the
-# only dependable way to build this app.
+# Why this repo is public: Actions on the private repo are quota-blocked on hosted runners, and its
+# self-hosted fallback cannot hold a bulk HTTPS transfer -- it has died fetching a 1MB action zip,
+# spent 39 minutes failing a NuGet restore, and dropped a run at exactly ten minutes with no logs.
+# A public repo gets free unlimited hosted minutes, which is the only dependable way to build this.
 #
 # Secrets, and they are NOT interchangeable:
 #   SRC_PAT - a GitHub token with read access to the private repo. Lets the runner check out current
@@ -124,6 +125,9 @@ jobs:
           }
           New-Item -ItemType Directory -Path app -Force | Out-Null
           Copy-Item private/sadhunam/src -Destination app/src -Recurse -Force
+          if (Test-Path private/sadhunam/tests) {
+            Copy-Item private/sadhunam/tests -Destination app/tests -Recurse -Force
+          }
           Write-Host "built from $env:SRC_REPO @ $(git -C private rev-parse --short HEAD)"
 
       # --- fallback path ---------------------------------------------------------------------
@@ -195,6 +199,24 @@ jobs:
             Start-Sleep -Seconds (10 * $i)
           }
           throw "restore failed after 4 attempts"
+
+      # Gate the build on the cross-platform suite. It used to run in the private repo, on a
+      # self-hosted runner that could not be relied on to reach the test step; here it runs on the
+      # same free runner as the build, so a red suite actually stops a release.
+      #
+      # Absent tests warn and continue rather than fail: this workflow's job is to produce a build,
+      # and refusing to when a directory is missing trades a working release for a stricter-looking
+      # one.
+      - name: Test Sadhunam.Core
+        shell: pwsh
+        run: |
+          $proj = "app/tests/Sadhunam.Core.Tests"
+          if (-not (Test-Path $proj)) {
+            Write-Host "::warning::$proj is absent - publishing without a test gate."
+            exit 0
+          }
+          dotnet test $proj -c Release --nologo
+          if ($LASTEXITCODE -ne 0) { throw "Core suite failed - not publishing this build." }
 
       - name: Build self-contained exe
         run: >
@@ -284,7 +306,8 @@ jobs:
           $notes = @"
           Sadhunam.App - self-contained win-x64, built on windows-latest.
 
-          Built $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC from ``$env:SRC_REPO`` @ ``$env:SRC_REF``.
+          Built $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC from ``$env:SRC_REPO`` @ ``$env:SRC_REF``,
+          after the Sadhunam.Core suite passed.
           $state
           "@
 
