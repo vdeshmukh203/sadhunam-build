@@ -7,12 +7,10 @@ name: private-build
 # self-hosted fallback is unreliable. A public repo gets free unlimited hosted minutes, which is the
 # only dependable way to build this app.
 #
-# Where the source comes from:
-#   - SRC_PAT set  -> the runner checks out the private repo directly. Always current; nothing to
-#                     maintain by hand. This is the intended mode.
-#   - SRC_PAT unset-> falls back to the committed source.enc blob. Works, but only as fresh as the
-#                     last time somebody re-encrypted it.
-# Either way the source exists only in the runner's ephemeral workspace and is never published.
+# Secrets, and they are NOT interchangeable:
+#   SRC_PAT - a GitHub token with read access to the private repo. Lets the runner check out current
+#             source. This is the intended mode; without it the build is only as fresh as source.enc.
+#   SRC_KEY - base64. Encrypts the published build (and decrypts source.enc on the fallback path).
 #
 # SECURITY: there is deliberately no pull_request trigger. GitHub withholds secrets from workflows
 # triggered by fork pull requests, and pull_request_target would defeat that protection, so neither
@@ -50,21 +48,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Decide where the source comes from
+      # Check the configuration before spending any time on it. The two secret names are similar
+      # enough to be swapped, and when that happens the symptom appears far from the cause.
+      - name: Preflight - validate secrets
         id: mode
         shell: pwsh
         env:
           SRC_PAT: ${{ secrets.SRC_PAT }}
+          SRC_KEY: ${{ secrets.SRC_KEY }}
         run: |
-          if ($env:SRC_PAT) {
-            Write-Host "source: private repo $env:SRC_REPO @ $env:SRC_REF (live)"
-            "mode=live" | Add-Content $env:GITHUB_OUTPUT
-          } elseif (Test-Path source.enc) {
-            Write-Host "::warning::SRC_PAT is not set - falling back to the committed source.enc, which is only as fresh as its last refresh. Set SRC_PAT to build current source."
-            "mode=blob" | Add-Content $env:GITHUB_OUTPUT
+          $problems = @()
+
+          # SRC_KEY must be base64. A GitHub token is the specific wrong value worth naming, because
+          # storing the PAT under SRC_KEY is the mistake the naming invites.
+          $keyOk = $false
+          if (-not $env:SRC_KEY) {
+            Write-Host "::warning::SRC_KEY is not set - the build will be published UNENCRYPTED."
+          } elseif ($env:SRC_KEY -match '^(gh[pousr]_|github_pat_)') {
+            $problems += "SRC_KEY holds a GitHub token. That belongs in SRC_PAT. SRC_KEY must be a base64 encryption key."
           } else {
-            throw "No source available: SRC_PAT is unset and source.enc is missing."
+            try { [Convert]::FromBase64String($env:SRC_KEY) | Out-Null; $keyOk = $true }
+            catch { $problems += "SRC_KEY is not valid base64 ($($_.Exception.Message.Split('.')[0]))." }
           }
+
+          $mode = ''
+          if ($env:SRC_PAT) {
+            if ($env:SRC_PAT -notmatch '^(gh[pousr]_|github_pat_)') {
+              Write-Host "::warning::SRC_PAT does not look like a GitHub token. If the checkout 404s, this is why."
+            }
+            $mode = 'live'
+            Write-Host "source: private repo $env:SRC_REPO @ $env:SRC_REF (live checkout)"
+          } elseif (Test-Path source.enc) {
+            $mode = 'blob'
+            Write-Host "::warning::SRC_PAT is not set. Falling back to the committed source.enc, which is only as fresh as its last manual refresh. Add a secret named exactly SRC_PAT (a token with read access to $env:SRC_REPO) to build current source."
+            if (-not $keyOk) {
+              $problems += "The fallback path needs SRC_KEY to decrypt source.enc, and SRC_KEY is unusable."
+            }
+          } else {
+            $problems += "No source available: SRC_PAT is unset and source.enc is missing."
+          }
+
+          if ($problems.Count -gt 0) {
+            Write-Host "::error::Configuration problems:"
+            $problems | ForEach-Object { Write-Host "::error::  - $_" }
+            Write-Host ""
+            Write-Host "Secrets live at Settings > Secrets and variables > Actions:"
+            Write-Host "  SRC_PAT = GitHub token with read access to $env:SRC_REPO   (classic: 'repo' scope)"
+            Write-Host "  SRC_KEY = base64 string used to encrypt the published build"
+            throw "preflight failed - see above"
+          }
+
+          "mode=$mode" | Add-Content $env:GITHUB_OUTPUT
+          "key_ok=$keyOk" | Add-Content $env:GITHUB_OUTPUT
 
       # --- live path -------------------------------------------------------------------------
       - name: Check out the private source
@@ -81,7 +116,12 @@ jobs:
         if: steps.mode.outputs.mode == 'live'
         shell: pwsh
         run: |
-          # The build below wants app/src/...; the private repo keeps it under sadhunam/src/.
+          $ErrorActionPreference = 'Stop'
+          # A token without repo scope can produce an empty checkout rather than an error, so this is
+          # checked here instead of surfacing later as a missing csproj.
+          if (-not (Test-Path private/sadhunam/src)) {
+            throw "private/sadhunam/src is missing after checkout. SRC_PAT most likely lacks read access to $env:SRC_REPO (a classic token needs the 'repo' scope), or the ref '$env:SRC_REF' does not exist."
+          }
           New-Item -ItemType Directory -Path app -Force | Out-Null
           Copy-Item private/sadhunam/src -Destination app/src -Recurse -Force
           Write-Host "built from $env:SRC_REPO @ $(git -C private rev-parse --short HEAD)"
@@ -97,8 +137,6 @@ jobs:
           SRC_KEY: ${{ secrets.SRC_KEY }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not $env:SRC_KEY) { throw "source.enc is present but SRC_KEY is not set - nothing can decrypt it." }
-
           $raw = [Convert]::FromBase64String($env:SRC_KEY)
           if ($raw.Length -in 16, 24, 32) {
             $key = $raw; Write-Host "key: $($raw.Length) bytes, used directly"
@@ -108,8 +146,8 @@ jobs:
           }
 
           $blob = [IO.File]::ReadAllBytes("source.enc")
-          if ($blob.Length -le 16) { throw "source.enc is $($blob.Length) bytes - too small to contain an IV and any ciphertext." }
-          if (($blob.Length - 16) % 16 -ne 0) { throw "source.enc is not a whole number of AES blocks after the 16-byte IV - it is truncated or not CBC ciphertext." }
+          if ($blob.Length -le 16) { throw "source.enc is $($blob.Length) bytes - too small to hold an IV and any ciphertext." }
+          if (($blob.Length - 16) % 16 -ne 0) { throw "source.enc is not a whole number of AES blocks after the 16-byte IV - truncated, or not CBC ciphertext." }
 
           $iv = New-Object byte[] 16
           $ct = New-Object byte[] ($blob.Length - 16)
@@ -119,12 +157,9 @@ jobs:
           try {
             $pt = $aes.CreateDecryptor().TransformFinalBlock($ct, 0, $ct.Length)
           } catch {
-            throw "Decrypt failed. This almost always means SRC_KEY does not match the key source.enc was encrypted with - the padding check is what fails first. ($($_.Exception.Message))"
+            throw "Decrypt failed, which almost always means SRC_KEY does not match the key source.enc was encrypted with - the padding check fails first. ($($_.Exception.Message))"
           }
-
-          # A zip starts with PK\x03\x04. Checking here turns a confusing Expand-Archive error into a
-          # clear one about the wrong key producing plausible-looking garbage.
-          if ($pt[0] -ne 0x50 -or $pt[1] -ne 0x4B) { throw "Decrypted output is not a zip archive - SRC_KEY is probably wrong." }
+          if ($pt[0] -ne 0x50 -or $pt[1] -ne 0x4B) { throw "Decrypted output is not a zip - SRC_KEY is probably wrong." }
 
           [IO.File]::WriteAllBytes("src.zip", $pt)
           Expand-Archive -Path src.zip -DestinationPath app -Force
@@ -148,7 +183,7 @@ jobs:
 
       # Restore separately, with retries: it is the only network-bound step, and a transient NuGet
       # failure should not cost the whole run. -r win-x64 keeps win-x86 and win-arm64 runtime packs
-      # out of the graph entirely, which is roughly a third of the download.
+      # out of the graph, roughly a third of the download.
       - name: Restore (win-x64, with retries)
         shell: pwsh
         run: |
@@ -177,23 +212,22 @@ jobs:
           $mb = [math]::Round((Get-Item $exe).Length / 1MB, 2)
           $files = (Get-ChildItem out -Recurse -File).Count
           Write-Host "built: $exe ($mb MB), $files files in out/"
-          # Self-contained WinUI publishes carry the runtime and the App SDK; a handful of files
-          # means the publish silently produced a framework-dependent stub.
           if ($files -lt 50) { throw "out/ holds only $files files - this is not a self-contained publish." }
           if (-not (Test-Path "out/Microsoft.WindowsAppRuntime.Bootstrap.dll")) {
-            Write-Host "::warning::WindowsAppRuntime bootstrap not found in out/ - the app may not start on a machine without the App SDK installed."
+            Write-Host "::warning::WindowsAppRuntime bootstrap missing from out/ - the app may not start without the App SDK installed."
           }
 
       - name: Package and encrypt the build
         shell: pwsh
         env:
           SRC_KEY: ${{ secrets.SRC_KEY }}
+          KEY_OK: ${{ steps.mode.outputs.key_ok }}
         run: |
           $ErrorActionPreference = 'Stop'
           Compress-Archive -Path out/* -DestinationPath app.zip -Force
 
-          if (-not $env:SRC_KEY) {
-            Write-Host "::warning::SRC_KEY is not set - publishing the build UNENCRYPTED."
+          if ($env:KEY_OK -ne 'True') {
+            Write-Host "::warning::No usable SRC_KEY - publishing the build UNENCRYPTED."
             Copy-Item app.zip app.enc -Force
             "encrypted=false" | Add-Content $env:GITHUB_ENV
             return
@@ -210,8 +244,8 @@ jobs:
           [Array]::Copy($ct, 0, $blob, 16, $ct.Length)
           [IO.File]::WriteAllBytes("app.enc", $blob)
 
-          # Verify the ciphertext opens before it is published. Shipping a blob nobody can decrypt
-          # is worse than failing here, because it is only discovered by whoever tries to use it.
+          # Verify the ciphertext opens before publishing it. Shipping a blob nobody can decrypt is
+          # worse than failing here, because only the person trying to use it would find out.
           $iv2 = New-Object byte[] 16
           $ct2 = New-Object byte[] ($blob.Length - 16)
           [Array]::Copy($blob, 0, $iv2, 0, 16)
@@ -242,9 +276,9 @@ jobs:
           $auth = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github+json" }
 
           $state = if ($env:encrypted -eq 'true') {
-            "``app.enc`` is AES-CBC ciphertext with the IV as the first 16 bytes - the same shape as source.enc, opened with the same SRC_KEY."
+            "``app.enc`` is AES-CBC ciphertext with the IV as the first 16 bytes, opened with SRC_KEY."
           } else {
-            "WARNING: SRC_KEY was not set, so ``app.enc`` is a PLAIN zip despite the name."
+            "WARNING: no usable SRC_KEY, so ``app.enc`` is a PLAIN zip despite the name."
           }
 
           $notes = @"
@@ -288,12 +322,12 @@ jobs:
           } "asset upload"
 
           # Read it back: an upload that reports success but stores nothing is a real failure mode,
-          # and the only way to know is to ask for the asset again.
+          # and asking for the asset again is the only way to know.
           $check = Invoke-RestMethod -Method Get -Uri "$api/releases/tags/latest" -Headers $auth
           $asset = $check.assets | Where-Object { $_.name -eq 'app.enc' }
           $local = (Get-Item app.enc).Length
-          if (-not $asset)                { throw "app.enc is not on the release after upload." }
-          if ($asset.size -ne $local)     { throw "published asset is $($asset.size) bytes, expected $local." }
-          if ($asset.state -ne 'uploaded'){ throw "published asset state is '$($asset.state)', expected 'uploaded'." }
+          if (-not $asset)                 { throw "app.enc is not on the release after upload." }
+          if ($asset.size -ne $local)      { throw "published asset is $($asset.size) bytes, expected $local." }
+          if ($asset.state -ne 'uploaded') { throw "published asset state is '$($asset.state)', expected 'uploaded'." }
 
           Write-Host "verified: app.enc $($asset.size) bytes -> $($check.html_url)"
