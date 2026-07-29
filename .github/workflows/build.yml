@@ -371,7 +371,15 @@ jobs:
       # copy and nothing else. It still fails the job: a run ending green having published half of
       # what it was asked to would be the same defect this workflow guards against everywhere else,
       # a state reported as success when it is not one.
-      - name: Publish the plain build to the private repo
+      # The public release above is the release. This step mirrors the same bytes into the private
+      # repo as plaintext, purely so the one person entitled to the build does not decrypt by hand.
+      # A convenience mirror must not be able to fail a build whose suite passed, whose app compiled,
+      # and whose real release is already published and verified -- which is exactly what it did on
+      # 2026-07-29, three runs in a row, on a rate limit. When that happens the step now says so and
+      # stops, leaving the job green, and the summary records that the mirror is stale so "published"
+      # and "mirrored" still never read as one state. A permissions failure still fails the build:
+      # that one is a real misconfiguration and waiting will not fix it.
+      - name: Mirror the plain build into the private repo (convenience copy)
         if: steps.mode.outputs.mode == 'live'
         shell: pwsh
         env:
@@ -417,8 +425,10 @@ jobs:
           } catch {
             $code = $_.Exception.Response.StatusCode.value__
             if ($code -eq 403 -and (Test-RateLimited $_)) {
-              Write-Host "::error::GitHub rate-limited the release API on $env:SRC_REPO (HTTP 403). This is NOT a token problem - SRC_PAT's scopes are fine and nothing needs regenerating. Re-run this build, and space consecutive builds further apart."
-              throw "rate limited publishing to $env:SRC_REPO - re-run, do not touch the token"
+              Write-Host "::warning::Rate-limited mirroring to $env:SRC_REPO (HTTP 403). NOT a token problem - SRC_PAT is fine and nothing needs regenerating. The public release is published and verified; only the private plaintext copy is stale. It refreshes on the next build."
+              "**Private mirror NOT refreshed** - rate limited (HTTP 403). The public ``app.enc`` release IS current. SRC_PAT is fine; do not regenerate it." `
+                | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              exit 0
             }
             if ($code -eq 403 -or $code -eq 404) {
               Write-Host "::error::SRC_PAT cannot write releases on $env:SRC_REPO (HTTP $code). The source checkout only needs read, so a token that works for that can still fail here. Give SRC_PAT 'repo' scope (classic), or Contents: read and write (fine-grained) on $env:SRC_REPO. If this same step succeeded on an earlier run today with the same secret, suspect a rate limit and re-run before changing anything."
@@ -443,6 +453,14 @@ jobs:
                 -InFile 'app.zip' | Out-Null
               break
             } catch {
+              # Same rule as the create above: a limit here leaves the mirror stale, not the build bad.
+              # Retrying into a limit only spends more of it, so this one stops rather than backing off.
+              if (Test-RateLimited $_) {
+                Write-Host "::warning::Rate-limited uploading the mirror to $env:SRC_REPO. NOT a token problem. The public release is published and verified; only the private plaintext copy is stale."
+                "**Private mirror NOT refreshed** - rate limited during upload. The public ``app.enc`` release IS current. SRC_PAT is fine; do not regenerate it." `
+                  | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+                exit 0
+              }
               if ($i -eq 3) { throw "asset upload failed after 3 attempts: $($_.Exception.Message)" }
               Write-Host "::warning::upload attempt $i failed, retrying"
               Start-Sleep -Seconds (5 * $i)
