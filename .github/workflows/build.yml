@@ -392,6 +392,21 @@ jobs:
           because this repository is private.
           "@
 
+          # GitHub answers 403 for two unrelated things: "this token may not do that" and "you are
+          # going too fast". They need opposite responses -- regenerate a credential, or wait -- so
+          # they must never arrive as one message. This step used to call every 403 a permissions
+          # failure and tell the reader to widen the token's scope, which on a rate limit sends them
+          # to fix a credential that was never broken. It is not hypothetical: on 2026-07-29 the
+          # private publish succeeded at 12:26 and returned 403 at 12:31 with the same secret, after
+          # four builds in twenty minutes each uploading ~74MB twice.
+          function Test-RateLimited($err) {
+            if ("$($err.ErrorDetails.Message)" -match 'rate limit') { return $true }
+            try {
+              $remaining = $err.Exception.Response.Headers.GetValues('x-ratelimit-remaining')
+              return ($remaining -and [int]($remaining | Select-Object -First 1) -eq 0)
+            } catch { return $false }
+          }
+
           # Reused rather than re-created. A release per build turns the sidebar into a list of
           # entries that all mean "the current build", and the download URL stops being stable.
           try {
@@ -401,8 +416,12 @@ jobs:
             Write-Host "created $tag on $env:SRC_REPO"
           } catch {
             $code = $_.Exception.Response.StatusCode.value__
+            if ($code -eq 403 -and (Test-RateLimited $_)) {
+              Write-Host "::error::GitHub rate-limited the release API on $env:SRC_REPO (HTTP 403). This is NOT a token problem - SRC_PAT's scopes are fine and nothing needs regenerating. Re-run this build, and space consecutive builds further apart."
+              throw "rate limited publishing to $env:SRC_REPO - re-run, do not touch the token"
+            }
             if ($code -eq 403 -or $code -eq 404) {
-              Write-Host "::error::SRC_PAT cannot write releases on $env:SRC_REPO (HTTP $code). The source checkout only needs read, so a token that works for that can still fail here. Give SRC_PAT 'repo' scope (classic), or Contents: read and write (fine-grained) on $env:SRC_REPO."
+              Write-Host "::error::SRC_PAT cannot write releases on $env:SRC_REPO (HTTP $code). The source checkout only needs read, so a token that works for that can still fail here. Give SRC_PAT 'repo' scope (classic), or Contents: read and write (fine-grained) on $env:SRC_REPO. If this same step succeeded on an earlier run today with the same secret, suspect a rate limit and re-run before changing anything."
               throw "SRC_PAT lacks write access to $env:SRC_REPO"
             }
             $rel = Invoke-RestMethod -Method Get -Uri "$api/releases/tags/$tag" -Headers $auth
