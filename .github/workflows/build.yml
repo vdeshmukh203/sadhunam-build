@@ -354,3 +354,89 @@ jobs:
           if ($asset.state -ne 'uploaded') { throw "published asset state is '$($asset.state)', expected 'uploaded'." }
 
           Write-Host "verified: app.enc $($asset.size) bytes -> $($check.html_url)"
+
+      # A second copy, in plaintext, on the private source repo — vdeshmukh203/claude-plans, the
+      # same repo the source is checked out of above, and nowhere else.
+      #
+      # The public release has to be ciphertext because anyone can read it, which leaves the owner
+      # decrypting their own build by hand every time. claude-plans is private, so the same zip can
+      # live there as-is and be downloaded and run with no extra step. One artifact, published
+      # twice, because the two repositories have opposite audiences.
+      #
+      # This needs SRC_PAT to carry WRITE access. Read is enough for the source checkout, so a token
+      # that has always worked can fail here — and the failure says exactly that rather than leaving
+      # a bare 403 to be interpreted.
+      #
+      # It runs after the public release is already published, so a failure here costs the private
+      # copy and nothing else. It still fails the job: a run ending green having published half of
+      # what it was asked to would be the same defect this workflow guards against everywhere else,
+      # a state reported as success when it is not one.
+      - name: Publish the plain build to the private repo
+        if: steps.mode.outputs.mode == 'live'
+        shell: pwsh
+        env:
+          SRC_PAT: ${{ secrets.SRC_PAT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $api  = "https://api.github.com/repos/$env:SRC_REPO"
+          $auth = @{ Authorization = "Bearer $env:SRC_PAT"; Accept = "application/vnd.github+json" }
+          $tag  = 'app-latest'
+
+          $notes = @"
+          Sadhunam.App - self-contained win-x64, plaintext.
+
+          Built $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC on a hosted windows-latest runner from
+          ``$env:SRC_REF``, after the Sadhunam.Core suite passed. Unzip and run ``Sadhunam.App.exe``.
+
+          The same build the public repo publishes as ``app.enc``; here it needs no decryption,
+          because this repository is private.
+          "@
+
+          # Reused rather than re-created. A release per build turns the sidebar into a list of
+          # entries that all mean "the current build", and the download URL stops being stable.
+          try {
+            $rel = Invoke-RestMethod -Method Post -Uri "$api/releases" -Headers $auth -Body (@{
+              tag_name = $tag; name = 'Sadhunam app (current build, plaintext)'; body = $notes
+            } | ConvertTo-Json)
+            Write-Host "created $tag on $env:SRC_REPO"
+          } catch {
+            $code = $_.Exception.Response.StatusCode.value__
+            if ($code -eq 403 -or $code -eq 404) {
+              Write-Host "::error::SRC_PAT cannot write releases on $env:SRC_REPO (HTTP $code). The source checkout only needs read, so a token that works for that can still fail here. Give SRC_PAT 'repo' scope (classic), or Contents: read and write (fine-grained) on $env:SRC_REPO."
+              throw "SRC_PAT lacks write access to $env:SRC_REPO"
+            }
+            $rel = Invoke-RestMethod -Method Get -Uri "$api/releases/tags/$tag" -Headers $auth
+            Invoke-RestMethod -Method Patch -Uri "$api/releases/$($rel.id)" -Headers $auth `
+              -Body (@{ body = $notes } | ConvertTo-Json) | Out-Null
+            Write-Host "reused $tag on $env:SRC_REPO"
+          }
+
+          foreach ($a in $rel.assets) {
+            if ($a.name -eq 'app.zip') {
+              Invoke-RestMethod -Method Delete -Uri "$api/releases/assets/$($a.id)" -Headers $auth
+            }
+          }
+
+          for ($i = 1; $i -le 3; $i++) {
+            try {
+              Invoke-RestMethod -Method Post -Headers $auth -ContentType 'application/octet-stream' `
+                -Uri "https://uploads.github.com/repos/$env:SRC_REPO/releases/$($rel.id)/assets?name=app.zip" `
+                -InFile 'app.zip' | Out-Null
+              break
+            } catch {
+              if ($i -eq 3) { throw "asset upload failed after 3 attempts: $($_.Exception.Message)" }
+              Write-Host "::warning::upload attempt $i failed, retrying"
+              Start-Sleep -Seconds (5 * $i)
+            }
+          }
+
+          # Read back, for the same reason the public publish does: an upload can report success and
+          # store nothing, and only asking for the asset again tells the two apart.
+          $check = Invoke-RestMethod -Method Get -Uri "$api/releases/tags/$tag" -Headers $auth
+          $asset = $check.assets | Where-Object { $_.name -eq 'app.zip' }
+          $local = (Get-Item app.zip).Length
+          if (-not $asset)                 { throw "app.zip is not on the private release after upload." }
+          if ($asset.size -ne $local)      { throw "published asset is $($asset.size) bytes, expected $local." }
+          if ($asset.state -ne 'uploaded') { throw "published asset state is '$($asset.state)', expected 'uploaded'." }
+
+          Write-Host "verified: app.zip $($asset.size) bytes -> $($check.html_url)"
