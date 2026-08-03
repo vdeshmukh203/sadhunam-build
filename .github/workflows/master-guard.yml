@@ -1,0 +1,131 @@
+name: master-guard
+
+# Does the private repo's default branch still compile?
+#
+# It did not, for days, and nothing said so. `master` was left holding two divergent implementations of
+# WebCrawler spliced together by a merge that produced no conflict marker; sixteen compiler errors, and
+# the tests belonging to the pull request that broke it had never once run. It surfaced only when a
+# reconcile was attempted from the integration branch and every verification step turned out to be
+# measuring the base's damage rather than the merge.
+#
+# The reason it hid is structural and worth stating: build.yml builds SRC_REF, which defaults to the
+# integration branch, so the build farm has never built master even once. **CI that only builds the
+# branch under development reports green straight through a default branch that does not compile.**
+#
+# So this is deliberately NOT part of build.yml:
+#
+#   - It must not publish. build.yml's release is the integration branch's build, and overwriting that
+#     with master's would make the download the user gets depend on which workflow ran last.
+#   - It runs on ubuntu-latest, because Sadhunam.Core is net8.0 and cross-platform. The question here is
+#     "does the default branch still compile and pass its own suite", which needs no Windows runner,
+#     no WindowsAppSDK restore and no 25-minute publish. Cheap enough to run daily without thinking
+#     about it.
+#   - Sadhunam.App is deliberately out of scope: it is WinUI and cannot build here. build.yml is where
+#     that is checked, on Windows, for the branch that is actually being shipped.
+
+on:
+  schedule:
+    # Daily. The failure this catches is not urgent within an hour — it is urgent within a week, which
+    # is roughly how long the last one went unnoticed.
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or SHA of the private repo to check (default: master)'
+        required: false
+        default: 'master'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: master-guard
+  cancel-in-progress: true
+
+env:
+  SRC_REPO: vdeshmukh203/claude-plans
+  SRC_REF: ${{ inputs.ref || 'master' }}
+
+jobs:
+  compiles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Preflight - the ref has to exist
+        shell: bash
+        env:
+          SRC_PAT: ${{ secrets.SRC_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SRC_PAT:-}" ]; then
+            echo "::error::SRC_PAT is not set. This workflow reads a private repository and cannot run without it."
+            exit 1
+          fi
+          # "Does not exist" and "could not ask" are different answers and get different treatment: a
+          # 404 is a fact about the ref and stops the run, anything else is a fact about the network
+          # and must not turn a GitHub outage into a red default branch.
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+                 -H "Authorization: Bearer $SRC_PAT" \
+                 -H "Accept: application/vnd.github+json" \
+                 "https://api.github.com/repos/$SRC_REPO/commits/$SRC_REF" || echo 000)
+          if [ "$code" = "404" ] || [ "$code" = "422" ]; then
+            echo "::error::SRC_REF '$SRC_REF' does not name a commit or branch in $SRC_REPO (HTTP $code)."
+            exit 1
+          elif [ "$code" != "200" ]; then
+            echo "::warning::Could not verify SRC_REF against $SRC_REPO (HTTP $code). Continuing — this says nothing about the ref."
+          fi
+
+      - name: Check out the private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_PAT }}
+          fetch-depth: 1
+
+      # A token without repo scope can produce an empty checkout rather than an error, and an empty
+      # tree builds cleanly — which would report the default branch as healthy on the strength of
+      # having compiled nothing at all.
+      - name: Refuse to check nothing
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d sadhunam/src/Sadhunam.Core || {
+            echo "::error::sadhunam/src/Sadhunam.Core is missing after checkout — SRC_PAT most likely lacks read access to $SRC_REPO."
+            exit 1
+          }
+          count=$(find sadhunam -name '*.cs' -not -path '*/obj/*' -not -path '*/bin/*' | wc -l)
+          echo "source: $count .cs files"
+          [ "$count" -ge 50 ] || { echo "::error::only $count .cs files — the tree looks truncated."; exit 1; }
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build Sadhunam.Core
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "checking $SRC_REPO @ $SRC_REF"
+          dotnet build sadhunam/src/Sadhunam.Core -c Release --nologo
+
+      # Building is the headline, but a default branch that compiles and fails its own suite is only
+      # marginally better than one that does not compile. Absent tests fail rather than warn: unlike
+      # build.yml, this workflow has nothing to deliver if it skips, so "no tests found" is a broken
+      # check and not a degraded build.
+      - name: Run the Core suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d sadhunam/tests/Sadhunam.Core.Tests || {
+            echo "::error::sadhunam/tests/Sadhunam.Core.Tests is missing — nothing to check."
+            exit 1
+          }
+          # The runner's summary is localised; pinned to English so anything parsing it downstream
+          # cannot read a German "Bestanden!" as no result at all.
+          DOTNET_CLI_UI_LANGUAGE=en dotnet test sadhunam/tests/Sadhunam.Core.Tests -c Release --nologo
+
+      - name: Say what was checked
+        if: always()
+        shell: bash
+        run: echo "$SRC_REPO @ $SRC_REF — see the steps above for the verdict." >> "$GITHUB_STEP_SUMMARY"
