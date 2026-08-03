@@ -39,7 +39,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: master-guard
+  # Keyed on the ref, not just the workflow. A flat group meant dispatching a check of one branch
+  # cancelled an in-flight check of another — so a manual run could silently kill the daily check of
+  # master, which is the one thing this workflow exists to do. Found by running two dispatches a few
+  # seconds apart and watching the first disappear.
+  group: master-guard-${{ inputs.ref || 'master' }}
   cancel-in-progress: true
 
 env:
