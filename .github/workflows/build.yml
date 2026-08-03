@@ -3,10 +3,9 @@ name: private-build
 # Builds Sadhunam.App (WinUI 3, Windows-only) on a free GitHub-hosted windows-latest runner and
 # publishes the result as ciphertext.
 #
-# Why this repo is public: Actions on the private repo are quota-blocked on hosted runners, and its
-# self-hosted fallback cannot hold a bulk HTTPS transfer -- it has died fetching a 1MB action zip,
-# spent 39 minutes failing a NuGet restore, and dropped a run at exactly ten minutes with no logs.
-# A public repo gets free unlimited hosted minutes, which is the only dependable way to build this.
+# Why this repo is public: Actions on the private repo are quota-blocked on hosted runners, and the
+# self-hosted fallback is unreliable. A public repo gets free unlimited hosted minutes, which is the
+# only dependable way to build this app.
 #
 # Secrets, and they are NOT interchangeable:
 #   SRC_PAT - a GitHub token with read access to the private repo. Lets the runner check out current
@@ -59,6 +58,46 @@ jobs:
           SRC_KEY: ${{ secrets.SRC_KEY }}
         run: |
           $problems = @()
+
+          # A short SHA is the trap this catches. actions/checkout only treats a ref as a commit when
+          # it is the full 40 characters; anything shorter is fetched as a branch name, finds nothing,
+          # and fails three times over about a minute with "git failed with exit code 1" and no hint
+          # that the ref was the problem. It has cost a red build here more than once, each time from
+          # someone pasting the output of `git rev-parse --short`.
+          if ($env:SRC_REF -match '^[0-9a-fA-F]{7,39}$') {
+            $problems += "SRC_REF '$env:SRC_REF' looks like an abbreviated commit SHA. actions/checkout resolves only full 40-character SHAs as commits, so this would be fetched as a branch name and fail. Pass the full SHA (git rev-parse HEAD) or a branch name."
+          }
+
+          # A full-length SHA that does not exist passes every shape check there is: 40 hex characters,
+          # right prefix, wrong from the eighth on, because it was typed from memory rather than read
+          # out of `git rev-parse HEAD`. That has happened. The shape guard above cannot see it, and the
+          # failure lands two steps later as actions/checkout's "git failed with exit code 1", which
+          # reads like a network problem and costs a cycle to tell apart from one.
+          #
+          # "Does not exist" and "could not check" are answered differently on purpose. A 404 from the
+          # API is a fact about the ref and stops the build; anything else - a timeout, a rate limit, a
+          # proxy - is a fact about the network, and failing the build on it would mean an outage at
+          # GitHub blocks every build here for a reason that has nothing to do with the request.
+          if ($env:SRC_PAT) {
+            $headers = @{
+              Authorization  = "Bearer $env:SRC_PAT"
+              'User-Agent'   = 'sadhunam-build'
+              Accept         = 'application/vnd.github+json'
+            }
+            try {
+              Invoke-RestMethod -Method Get -Headers $headers -ErrorAction Stop `
+                -Uri "https://api.github.com/repos/$env:SRC_REPO/commits/$env:SRC_REF" | Out-Null
+              Write-Host "SRC_REF '$env:SRC_REF' resolves in $env:SRC_REPO."
+            } catch {
+              $code = $null
+              try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+              if ($code -eq 404 -or $code -eq 422) {
+                $problems += "SRC_REF '$env:SRC_REF' does not name a commit or branch in $env:SRC_REPO (HTTP $code). If it is a SHA, it was not read from ``git rev-parse HEAD``; if it is a branch, it has not been pushed."
+              } else {
+                Write-Host "::warning::Could not verify SRC_REF '$env:SRC_REF' against $env:SRC_REPO ($($_.Exception.Message)). Continuing - this says nothing about the ref."
+              }
+            }
+          }
 
           # SRC_KEY must be base64. A GitHub token is the specific wrong value worth naming, because
           # storing the PAT under SRC_KEY is the mistake the naming invites.
@@ -128,6 +167,12 @@ jobs:
           if (Test-Path private/sadhunam/tests) {
             Copy-Item private/sadhunam/tests -Destination app/tests -Recurse -Force
           }
+          # The check scripts too. Without these the gates below have to be reimplemented inline in
+          # PowerShell, and two implementations of one rule is how a gate quietly stops matching the
+          # thing it guards.
+          if (Test-Path private/sadhunam/scripts) {
+            Copy-Item private/sadhunam/scripts -Destination app/scripts -Recurse -Force
+          }
           Write-Host "built from $env:SRC_REPO @ $(git -C private rev-parse --short HEAD)"
 
       # --- fallback path ---------------------------------------------------------------------
@@ -181,6 +226,65 @@ jobs:
           Write-Host "source: $count .cs files"
           if ($count -lt 50) { throw "Only $count .cs files - the source tree looks truncated." }
 
+      # A source file holding a raw control byte still compiles, but git classifies it as binary and
+      # prints "Bin 6493 -> 6586 bytes" in place of its diff. Since a code patch reaches this repo
+      # only after a human reads that diff, a byte that empties it is a hole in the approval gate.
+      # Caught here rather than at review time, because by review time it is invisible.
+      #
+      # Every gate below invokes the real script rather than restating its rule in PowerShell.
+      #
+      # The hygiene check used to be a hand-written copy here, carrying a comment explaining that
+      # scripts/ never reaches the runner. That stopped being true when the layout step above started
+      # copying it, and the copy stayed — so CI was running the weaker of two implementations of one
+      # rule while the authoritative one sat unused three directories away. That is the exact failure
+      # this project keeps naming, and it had taken root inside its own build.
+      #
+      # Skipped with a warning rather than failed when scripts/ is absent, which is the blob fallback
+      # path. A gate that could not run must never be reported as a gate that passed.
+      - name: Check every UI control reaches a handler
+        shell: pwsh
+        run: |
+          if (-not (Test-Path app/scripts/check-ui-wiring.py)) {
+            Write-Host "::warning::scripts/ absent in this layout - UI wiring NOT checked"
+          } else {
+            python app/scripts/check-ui-wiring.py app
+            if ($LASTEXITCODE -ne 0) { throw "unwired UI controls - see above" }
+          }
+
+      - name: Check text hygiene
+        shell: pwsh
+        run: |
+          if (-not (Test-Path app/scripts/check-text-hygiene.py)) {
+            Write-Host "::warning::scripts/ absent in this layout - text hygiene NOT checked"
+          } else {
+            python app/scripts/check-text-hygiene.py app
+            if ($LASTEXITCODE -ne 0) { throw "raw control characters or bidi overrides in source - see above" }
+          }
+
+      # Neither of these ran in CI at all before. An App file naming a Core type with no import for it
+      # fails the Windows build anyway, but it fails it as a wall of CS0246 rather than as one line
+      # naming the missing using; and the culture ratchet cannot be caught by a build at all, because
+      # a number rendered in the machine's locale compiles perfectly.
+      - name: Check App imports
+        shell: pwsh
+        run: |
+          if (-not (Test-Path app/scripts/check-imports.py)) {
+            Write-Host "::warning::scripts/ absent in this layout - imports NOT checked"
+          } else {
+            python app/scripts/check-imports.py app
+            if ($LASTEXITCODE -ne 0) { throw "App file uses a Core type without importing it - see above" }
+          }
+
+      - name: Culture ratchet
+        shell: pwsh
+        run: |
+          if (-not (Test-Path app/scripts/find-culture-sites.py)) {
+            Write-Host "::warning::scripts/ absent in this layout - culture ratchet NOT checked"
+          } else {
+            python app/scripts/find-culture-sites.py app
+            if ($LASTEXITCODE -ne 0) { throw "more numbers rendered in the machine's culture than the cap allows - see above" }
+          }
+
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
@@ -201,22 +305,29 @@ jobs:
           throw "restore failed after 4 attempts"
 
       # Gate the build on the cross-platform suite. It used to run in the private repo, on a
-      # self-hosted runner that could not be relied on to reach the test step; here it runs on the
-      # same free runner as the build, so a red suite actually stops a release.
+      # self-hosted runner that could not be relied on to finish; here it runs on the same free
+      # runner as the build, so a red suite actually stops a release instead of being skipped.
+      # Both suites, named separately so a red one is attributable without opening the log.
       #
-      # Absent tests warn and continue rather than fail: this workflow's job is to produce a build,
-      # and refusing to when a directory is missing trades a working release for a stricter-looking
-      # one.
-      - name: Test Sadhunam.Core
+      # Sadhunam.App.Tests covers the App files that carry no WinUI reference — the executor that runs
+      # commands on the machine among them. It builds on this runner for the same reason it builds on
+      # Linux: it links those files rather than referencing the WinUI project.
+      - name: Test Sadhunam.Core and Sadhunam.App
         shell: pwsh
         run: |
-          $proj = "app/tests/Sadhunam.Core.Tests"
-          if (-not (Test-Path $proj)) {
-            Write-Host "::warning::$proj is absent - publishing without a test gate."
-            exit 0
+          $suites = @("app/tests/Sadhunam.Core.Tests", "app/tests/Sadhunam.App.Tests")
+          $ran = 0
+          foreach ($proj in $suites) {
+            if (-not (Test-Path $proj)) {
+              Write-Host "::warning::$proj is absent - not run."
+              continue
+            }
+            $ran++
+            dotnet test $proj -c Release --nologo
+            if ($LASTEXITCODE -ne 0) { throw "$proj failed - not publishing this build." }
           }
-          dotnet test $proj -c Release --nologo
-          if ($LASTEXITCODE -ne 0) { throw "Core suite failed - not publishing this build." }
+          # A build that published having run no tests at all must say so rather than look gated.
+          if ($ran -eq 0) { Write-Host "::warning::no test project was present - publishing WITHOUT a test gate." }
 
       - name: Build self-contained exe
         run: >
@@ -306,8 +417,7 @@ jobs:
           $notes = @"
           Sadhunam.App - self-contained win-x64, built on windows-latest.
 
-          Built $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC from ``$env:SRC_REPO`` @ ``$env:SRC_REF``,
-          after the Sadhunam.Core suite passed.
+          Built $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC from ``$env:SRC_REPO`` @ ``$env:SRC_REF``.
           $state
           "@
 
@@ -355,22 +465,6 @@ jobs:
 
           Write-Host "verified: app.enc $($asset.size) bytes -> $($check.html_url)"
 
-      # A second copy, in plaintext, on the private source repo — vdeshmukh203/claude-plans, the
-      # same repo the source is checked out of above, and nowhere else.
-      #
-      # The public release has to be ciphertext because anyone can read it, which leaves the owner
-      # decrypting their own build by hand every time. claude-plans is private, so the same zip can
-      # live there as-is and be downloaded and run with no extra step. One artifact, published
-      # twice, because the two repositories have opposite audiences.
-      #
-      # This needs SRC_PAT to carry WRITE access. Read is enough for the source checkout, so a token
-      # that has always worked can fail here — and the failure says exactly that rather than leaving
-      # a bare 403 to be interpreted.
-      #
-      # It runs after the public release is already published, so a failure here costs the private
-      # copy and nothing else. It still fails the job: a run ending green having published half of
-      # what it was asked to would be the same defect this workflow guards against everywhere else,
-      # a state reported as success when it is not one.
       # The public release above is the release. This step mirrors the same bytes into the private
       # repo as plaintext, purely so the one person entitled to the build does not decrypt by hand.
       # A convenience mirror must not be able to fail a build whose suite passed, whose app compiled,
