@@ -21,19 +21,23 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
+          import re
 
           p = Path('.github/workflows/build.yml')
           s = p.read_text()
-          replacements = {
-              "default: 'claude/browser-ui-merge-reconcile-2kwygj'": "default: 'main'",
-              'SRC_REPO: vdeshmukh203/claude-plans': 'SRC_REPO: vdeshmukh203/Sadhunam',
-              "SRC_REF: ${{ inputs.ref || 'claude/browser-ui-merge-reconcile-2kwygj' }}": "SRC_REF: ${{ inputs.ref || 'main' }}",
-              'private/sadhunam/': 'private/',
-          }
-          for old, new in replacements.items():
-              if old not in s:
-                  raise SystemExit(f'build.yml expected text missing: {old}')
-              s = s.replace(old, new)
+          if "default: 'claude/browser-ui-merge-reconcile-2kwygj'" not in s:
+              raise SystemExit('build.yml old default ref missing')
+          if 'SRC_REPO: vdeshmukh203/claude-plans' not in s:
+              raise SystemExit('build.yml old source repo missing')
+          if 'private/sadhunam/' not in s:
+              raise SystemExit('build.yml old source layout missing')
+          s = s.replace("default: 'claude/browser-ui-merge-reconcile-2kwygj'", "default: 'main'")
+          s = s.replace('SRC_REPO: vdeshmukh203/claude-plans', 'SRC_REPO: vdeshmukh203/Sadhunam')
+          expression = chr(36) + "{{ inputs.ref || 'main' }}"
+          s, n = re.subn(r'(?m)^  SRC_REF:.*$', '  SRC_REF: ' + expression, s, count=1)
+          if n != 1:
+              raise SystemExit('build.yml SRC_REF line not found exactly once')
+          s = s.replace('private/sadhunam/', 'private/')
           p.write_text(s)
 
           old = Path('.github/workflows/master-guard.yml')
